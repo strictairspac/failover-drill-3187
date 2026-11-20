@@ -2,7 +2,7 @@
 衡石数据值班组（10人）把节点巡检、故障剧本与切主证明合并为可复核演练记录。
 
 ## 业务与模块
-原流程用值班表记录节点、聊天传递故障、人工比较日志。痛点：输入版本混乱、隔离证明缺失、决策无法复查。上游是巡检记录；本工具替代人工纸上演练；下游是复核人和运维值班负责人。模块为节点状态、故障剧本、演练队列、决策证据，配套登录及JSON导出。三个实体 Node / Scenario / Drill 全链路实现。
+原流程用值班表记录节点、聊天传递故障、人工比较日志。痛点：输入版本混乱、隔离证明缺失、决策无法复查。上游是巡检记录；本工具替代人工纸上演练；下游是复核人和运维值班负责人。模块为节点状态、故障剧本、演练队列、决策证据、崩溃恢复演练，配套登录及JSON导出。实体 Node / Scenario / Drill 全链路实现，恢复演练以 RecoverySession 保存分步状态。
 
 **边界：受控教学/运维演练计算模型，不连接真实复制集群、不执行真实生产选主；任期、日志位置和fencing均由用户输入声明。** 本题真实 MySQL 保存业务输入/快照/结果，Python 实际计算规则，后台 worker 异步处理。
 
@@ -25,9 +25,13 @@ docker compose down --remove-orphans
 
 ## 一天剧本
 09:00操作员登录；09:05核对hs-primary日志8100、hs-east日志8100、hs-west日志8098，任期均6；09:10创建shift-20261117剧本，允许损失0、新任期门槛7、主故障且已隔离；09:20提交晚班演练；09:25查看候选hs-east、新任期7、多数派2/2；09:30导出JSON；09:35运行“缺少隔离证明”案例，应阻断；09:40观察员复核但新增返回403；10:00管理员查看 /api/audits。
+夜班（崩溃恢复）：22:10打开`#recovery`进入“夜班断电演练”；22:15发起A→C转账100并提交，确认两页未刷盘但日志已落盘；22:20发起B→D转账50不提交，刷页P2（steal）；22:25开始检查点、再转A→C 30并提交、完成检查点（模糊并发）；22:30刷两页后安全截断，逐条核对留存原因；22:35再发起C→A 80不提交，直接断电；22:40重启后逐步恢复，中途再断电一次，重试后A=870/B=800/C=730/D=400不重复扣款；22:50重置后演示强制截断9999再断电，已提交转账丢失并被报告。
 
 ## 算法口径
 输入为入队时冻结的节点与剧本快照。法定票数 floor(配置投票节点数/2)+1；可达票扣除不可达/已隔离/本次故障主节点；候选必须可达、有投票权、非主、未隔离且落后量不超过允许日志损失。新任期=max(节点任期)+1。所有安全条件成立时按日志位置降序、节点名升序确定候选；缺少旧主fencing、票数不足、未触发故障、任期不足或无合格候选均阻断。空节点、零投票节点、多个主节点计算失败并保存原因。结果含输入SHA256与模型版本，可重复计算。不会伪造真实集群共识证据。
+
+## 崩溃恢复演练口径
+页面 `#recovery` 分步驱动一个 ARIES 风格教学模型（`backend/src/services/recovery_engine.py`，纯函数引擎，状态随 RecoverySession 落 MySQL）。账户 A/B 在页 P1、C/D 在页 P2，一笔跨页转账改两页。规则：先写 WAL 再改缓冲页；提交只强制刷日志到 commit LSN 即确认，不刷数据页（no-force）；未提交的脏页允许落盘（steal）；检查点只快照事务表与脏页表、不刷页、不阻塞转账（模糊检查点）。安全截断线 = min(未提交事务首LSN, 脏页recLSN, 检查点锚点)，页面逐条标注日志留存原因；强制截断越过安全线属于误删，崩溃后对应已提交转账丢失并被检测报告。断电清空缓冲池/日志缓冲/事务表/锁，重启后分析→重做（pageLSN≥LSN 则跳过，幂等）→回滚（CLR+undoNext，幂等），恢复中可再断电验证不重复扣款。未提交事务持有其改过账户的锁，避免脏读使账无法自圆。动作：transfer / commit / flush_page / checkpoint_begin / checkpoint_end / truncate / crash / restart / recover_step / recover_run / reset，POST `/recovery/sessions/{id}/steps` 同步计算并审计。台账（已提交转账业务记录）在引擎之外，用于对照恢复余额、暴露丢失。
 
 ## 工程
 |组件|技术|
@@ -40,6 +44,6 @@ docker compose down --remove-orphans
 
 目录：frontend/src/api、stores、types、components/common、hooks、pages、router、utils、constants；backend/src/routes、controllers、services、models、schemas、middlewares、utils、constants、config；backend/scripts；backend/migrations。本地开发：安装backend/requirements.txt并设DATABASE_URL、REDIS_URL、JWT_SECRET，再运行uvicorn；前端以Nginx代理/api/去除前缀。
 
-环境：COMPOSE_PROJECT_NAME控制隔离命名；FRONTEND_PORT/BACKEND_PORT/DB_PORT为端口；DB_PASSWORD为演示数据库密码；JWT_SECRET为签名密钥；SEED_DEMO=false关闭演示数据。命名卷db-data、redis-data、artifacts；reset时显式down -v删除数据。前端字体依赖Google Fonts，离线回退serif/sans-serif。模型是简化安全门禁，非完整Raft实现。MIT许可。
+环境：COMPOSE_PROJECT_NAME控制隔离命名；FRONTEND_PORT/BACKEND_PORT/DB_PORT为端口；DB_PASSWORD为演示数据库密码；JWT_SECRET为签名密钥；SEED_DEMO=false关闭演示数据。命名卷db-data、redis-data、artifacts；reset时显式down -v删除数据。前端字体依赖Google Fonts，离线回退serif/sans-serif。切主模型是简化安全门禁，非完整Raft实现；恢复模型是教学用单机动词，非生产存储引擎。MIT许可。
 
-枚举：角色在backend/src/constants/enums.py和frontend/src/constants/enums.js；任务状态同处定义，使用于models/entities.py、services/drill_service.py、worker.py、components/common/status.js；节点角色在schemas/node.py、pages/nodes.js。测试、截图与已知差异见批次test-artifacts/gb-4110/TESTING.md。
+枚举：角色在backend/src/constants/enums.py和frontend/src/constants/enums.js；任务状态同处定义，使用于models/entities.py、services/drill_service.py、worker.py、components/common/status.js；节点角色在schemas/node.py、pages/nodes.js；恢复会话状态RECOVERY_STATUSES（running/crashed/recovering）同处定义。恢复引擎自测：python3 backend/tests/test_recovery_engine.py 与 test_recovery_journey.py（纯标准库，覆盖两页转账、steal/no-force、模糊检查点、安全/危险截断、恢复中再断电幂等）。测试、截图与已知差异见批次test-artifacts/gb-4110/TESTING.md。

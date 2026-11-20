@@ -1,7 +1,8 @@
 import os
 from sqlalchemy import select
 from src.config.database import Base, engine, Session
-from src.models.entities import User, Node, Scenario
+from src.models.entities import User, Node, Scenario, RecoverySession
+from src.services.recovery_engine import new_state
 from src.utils.security import hash_password
 
 def seed():
@@ -18,5 +19,7 @@ def seed():
         for name, fence in [('晚班隔离演练',True),('缺少隔离证明',False)]:
             if not db.scalar(select(Scenario).where(Scenario.name == name)):
                 db.add(Scenario(name=name, fail_primary=True, fence_primary=fence, max_data_loss=0, required_term=7))
+        if not db.scalar(select(RecoverySession).where(RecoverySession.name == '夜班断电演练')):
+            db.add(RecoverySession(name='夜班断电演练', status='running', state=new_state('夜班断电演练')))
         db.commit()
 if __name__ == '__main__': seed()
